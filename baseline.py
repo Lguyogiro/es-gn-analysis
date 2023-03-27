@@ -6,29 +6,76 @@ example.
 import argparse
 import random
 import pycrfsuite
+from emoji import UNICODE_EMOJI
+from string import punctuation
 from itertools import chain
+import langid
+from nltk import ngrams
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.preprocessing import LabelBinarizer
 
+
+def override_preds(token_sents, preds, task=1):
+    if task == 1:
+        new_preds = []
+        for j, sent in enumerate(token_sents):
+            new_sent_preds = []
+            for i, w in enumerate(sent):
+                if all((ch in UNICODE_EMOJI["en"] or ch in punctuation or ch in "0123456789") for ch in w):
+                    new_sent_preds.append("other")
+                else:
+                    new_sent_preds.append(preds[j][i])
+            new_preds.append(new_sent_preds)
+        return new_preds
+    elif task == 3:
+        new_preds = []
+        for j, sent in enumerate(token_sents):
+            new_sent_preds = []
+            prev_was_cc = False
+            for i, w in enumerate(sent):
+                lang_pred, score = langid.classify(w)
+                if lang_pred == "es":
+                    if prev_was_cc is False:
+                        new_sent_preds.append("b-cc")
+                        prev_was_cc = True
+                    else:
+                        new_sent_preds.append("i-cc")
+                else:
+                    new_sent_preds.append(preds[j][i])
+                    prev_was_cc = False
+            new_preds.append(new_sent_preds)
+        return new_preds
+    else:
+        return preds
+        
 def word2features(sent, i):
     word = sent[i][0]
     lowered_word = word.lower()
+    bigrams = ["".join(bg) for bg in ngrams("^" + lowered_word + "$", 2)]
     features = [
         'bias',
         'word.lower=' + lowered_word,
         'word[-3:]=' + lowered_word[-3:],
         'word[-2:]=' + lowered_word[-2:],
+        'word[:2]=' + lowered_word[:2],
+        'word[:3]=' + lowered_word[:3],
         'word.isupper=%s' % word.isupper(),
         'word.istitle=%s' % word.istitle(),
         'word.isdigit=%s' % word.isdigit()
     ]
+    features.extend([f"bigram={bg}" for bg in bigrams])
+
     if i > 0:
         word1 = sent[i-1][0]
         lowered_word1 = word1.lower()
         features.extend([
             '-1:word.lower=' + lowered_word1,
             '-1:word.istitle=%s' % word1.istitle(),
-            '-1:word.isupper=%s' % word1.isupper()
+            '-1:word.isupper=%s' % word1.isupper(),
+            '-1:word[-3:]=' + lowered_word1[-3:],
+            '-1:word[-2:]=' + lowered_word1[-2:],
+            '-1:word[:2]=' + lowered_word1[:2],
+            '-1:word[:3]=' + lowered_word1[:3],
         ])
     else:
         features.append('BOS')
@@ -39,7 +86,11 @@ def word2features(sent, i):
         features.extend([
             '+1:word.lower=' + lowered_word1,
             '+1:word.istitle=%s' % word1.istitle(),
-            '+1:word.isupper=%s' % word1.isupper()
+            '+1:word.isupper=%s' % word1.isupper(),
+            '+1word[-3:]=' + lowered_word1[-3:],
+            '+1word[-2:]=' + lowered_word1[-2:],
+            '+1word[:2]=' + lowered_word1[:2],
+            '+1word[:3]=' + lowered_word1[:3],
         ])
     else:
         features.append('EOS')
@@ -117,37 +168,88 @@ def bio_classification_report(y_true, y_pred):
         target_names = tagset,
     )
 
-def predict_and_evaluate(tagger, X_test, y_test):
+def evaluate(labels, preds):
+    print(bio_classification_report(labels, preds))
+
+def predict(tagger, test_tokens, X_test, task):
     preds = [tagger.tag(feature_bundle) for feature_bundle in X_test]
-    print(bio_classification_report(y_test, preds))
+    preds = override_preds(test_tokens, preds, task=task)
     return preds
+
+def predict_and_evaluate(tagger, test_tokens, X_test, y_test, task):
+    preds = predict(tagger, test_tokens, X_test, task)
+    evaluate(y_test, preds)
+    return preds
+
+
+def get_nfold_data(n_folds, task=1):
+    with open(f"gua_spa_train_dev/task{task}/train.conllu") as f:
+        sents = []
+        for sent in f.read().strip("\n").split("\n\n"):
+            sent = [
+                line.strip("\t \n").split("\t") 
+                for line in sent.split("\n") 
+            ]
+            sents.append(sent)
+    random.shuffle(sents)
+    test_size = len(sents) // n_folds
+    folded = []
+    idx = 0
+    for _ in range(n_folds):
+        folded.append(sents[idx:idx+test_size])
+        idx += test_size
+    for i in range(n_folds):
+        test = folded[i]
+        train = [sent for j in range(len(folded)) 
+                 for sent in folded[j] if j != i]
+        yield train, test
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--task", default=1, help="1, 2, or 3")
+    argparser.add_argument("--xval", action="store_true")
+    argparser.add_argument("--nfolds", default=10)
     args = argparser.parse_args()
 
-    train, test = load_data(task=args.task)
+    if args.xval:
+        all_predictions = []
+        all_labels = []
+        fold_iter = get_nfold_data(args.nfolds, task=args.task)
+        for i, (train, test) in enumerate(fold_iter):
+            X_train = [sent2features(s) for s in train]
+            y_train = [sent2labels(s) for s in train]
+            X_test = [sent2features(s) for s in test]
+            y_test = [sent2labels(s) for s in test]
+            test_tokens = [sent2tokens(s) for s in test]
+            model = train_crf(X_train, y_train)
+            preds = predict(model, test_tokens, X_test, args.task)
+            all_predictions.extend(preds)
+            all_labels.extend(y_test)
+            print(f"Finished fold {i}")
+        evaluate(all_labels, all_predictions)
+
+    if not args.xval:
+        train, test = load_data(task=args.task)
+        X_train = [sent2features(s) for s in train]
+        y_train = [sent2labels(s) for s in train]
+        X_test = [sent2features(s) for s in test]
+        y_test = [sent2labels(s) for s in test]
+        test_tokens = [sent2tokens(s) for s in test]
+        model = train_crf(X_train, y_train)
+        preds = predict_and_evaluate(model, 
+                                     test_tokens, 
+                                     X_test, 
+                                     y_test, 
+                                     args.task)
+        dataforeval = []
+        for i, sent in enumerate(test):
+            for j, token in enumerate(sent):
+                w = token[0]
+                label = token[1]
+                pred = preds[i][j]
+                dataforeval.append(f"{w}\t{label}\t{pred}")
+            dataforeval.append("")
+
+        with open(f"baseline_predictions_task={args.task}", "w") as fout:
+            fout.write("\n".join(dataforeval))
     
-    X_train = [sent2features(s) for s in train]
-    
-    y_train = [sent2labels(s) for s in train]
-
-    X_test = [sent2features(s) for s in test]
-    y_test = [sent2labels(s) for s in test]
-
-    model = train_crf(X_train, y_train)
-
-    preds = predict_and_evaluate(model, X_test, y_test)
-
-    dataforeval = []
-    for i, sent in enumerate(test):
-        for j, token in enumerate(sent):
-            w = token[0]
-            label = token[1]
-            pred = preds[i][j]
-            dataforeval.append(f"{w}\t{label}\t{pred}")
-        dataforeval.append("")
-
-    with open(f"baseline_predictions_task={args.task}", "w") as fout:
-        fout.write("\n".join(dataforeval))
