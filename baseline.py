@@ -107,16 +107,25 @@ def sent2labels(sent):
 def sent2tokens(sent):
     return [token for token, _ in sent]
 
-def load_data(task=1):
-    with open(f"gua_spa_train_dev/task{task}/train.conllu") as f:
+def load_data(train_only=None, dev=True):
+    if dev is True:
+        p = f"official_data/dev_combined.conllu"
+    else:
+        p = f"official_data/train_combined.conllu"
+
+    with open(p) as f:
         sents = []
         for sent in f.read().strip("\n").split("\n\n"):
             sent = [
                 line.strip("\t \n").split("\t") 
                 for line in sent.split("\n") 
             ]
+
             sents.append(sent)
 
+    if train_only is not None or dev is True:
+        return sents
+    
     random.shuffle(sents)
     train_size = int(len(sents) * 0.8)
     train = sents[:train_size]
@@ -157,7 +166,7 @@ def bio_classification_report(y_true, y_pred):
     y_true_combined = lb.fit_transform(list(chain.from_iterable(y_true)))
     y_pred_combined = lb.transform(list(chain.from_iterable(y_pred)))
         
-    tagset = set(lb.classes_) - {'0'}
+    tagset = set(lb.classes_) - {'O', '0'}
     tagset = sorted(tagset, key=lambda tag: tag.split('-', 1)[::-1])
     class_indices = {cls: idx for idx, cls in enumerate(lb.classes_)}
     
@@ -208,7 +217,14 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--task", default=1, help="1, 2, or 3")
     argparser.add_argument("--xval", action="store_true")
+    argparser.add_argument("--train_only", action="store_true")
+    argparser.add_argument("--predict", action="store_true")
+    argparser.add_argument("--model")
+    argparser.add_argument("--path_to_data")
+    argparser.add_argument("--data_to_predict")
     argparser.add_argument("--nfolds", default=10)
+    argparser.add_argument("--save_model_path")
+
     args = argparser.parse_args()
 
     if args.xval:
@@ -221,14 +237,37 @@ if __name__ == "__main__":
             X_test = [sent2features(s) for s in test]
             y_test = [sent2labels(s) for s in test]
             test_tokens = [sent2tokens(s) for s in test]
-            model = train_crf(X_train, y_train)
+            model = train_crf(X_train, y_train, model_name=f"task{args.task}_baseline.crfsuite")
             preds = predict(model, test_tokens, X_test, args.task)
             all_predictions.extend(preds)
             all_labels.extend(y_test)
             print(f"Finished fold {i}")
         evaluate(all_labels, all_predictions)
+    
+    elif args.train_only:
+        train = load_data(dev=False)[0]
+        import pdb;pdb.set_trace()
+        X_train = [sent2features(s[0]) for s in train]
+        y_train = [sent2labels(s) for s in train]
+        model = train_crf(X_train, y_train, model_name=f"task{args.task}_baseline.crfsuite")
 
-    if not args.xval:
+
+    elif args.predict:
+        tagger = pycrfsuite.Tagger()
+        tagger.open(args.model)
+        dev = load_data(task=args.task, dev=True)
+        X_test = [sent2features(s) for s in dev]
+        test_tokens = [sent2tokens(s) for s in dev]
+
+        preds = predict(tagger, 
+                        test_tokens,
+                        X_test, 
+                        args.task)
+        with open(f"preds_task{args.task}.txt", "w") as f:
+            f.write("\n\n".join(["\n".join(s) for s in preds]))
+
+
+    else:
         train, test = load_data(task=args.task)
         X_train = [sent2features(s) for s in train]
         y_train = [sent2labels(s) for s in train]
@@ -236,6 +275,7 @@ if __name__ == "__main__":
         y_test = [sent2labels(s) for s in test]
         test_tokens = [sent2tokens(s) for s in test]
         model = train_crf(X_train, y_train)
+
         preds = predict_and_evaluate(model, 
                                      test_tokens, 
                                      X_test, 
